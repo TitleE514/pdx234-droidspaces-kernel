@@ -1,0 +1,275 @@
+name: Build Droidspaces Kernel (pdx234 / Xperia 1 V)
+
+# Builds a 5.15.211 kernel for the Sony Xperia 1 V (pdx234) running
+# Evolution X 12.1 (Android 17), based on tyty-android/android_kernel_sony_sm8550
+# branch "custom" -- the exact kernel source declared by that ROM's build author.
+#
+# Adds Droidspaces support (sysvipc / posix-mqueue / IPC+user namespaces) and
+# optionally NTsync, then packages the resulting Image with AnyKernel3.
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_ref:
+        description: 'AOSP prebuilt clang branch (refs/heads/<this>)'
+        required: true
+        default: 'android16-release'
+      clang_version:
+        description: 'AOSP prebuilt clang version directory'
+        required: true
+        default: 'clang-r547379'
+      enable_ntsync:
+        description: 'Apply NTsync patches and enable CONFIG_NTSYNC'
+        type: boolean
+        default: true
+      enable_extras:
+        description: 'Enable optional extras (ipset / UFW / NAT / TMPFS_XATTR / cgroup limits)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: tyty-android/android_kernel_sony_sm8550
+  KERNEL_REF: custom
+  PATCH_REPO: Goldzxcbug/Droidspaces_Kernel_patch
+  PATCH_REF: main
+  DEVICE: pdx234
+  LOCALVERSION: -droidspaces
+  MAKE_ARGS: >-
+    O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
+    CC="ccache clang"
+    CROSS_COMPILE=aarch64-linux-gnu-
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+    CLANG_TRIPLE=aarch64-linux-gnu-
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-swapfile: 'true'
+          remove-cached-tools: 'false'
+          verbose: 'true'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            ccache libelf-dev libssl-dev bc bison flex \
+            python3 python-is-python3 dwarves build-essential libc6-dev \
+            curl git zip unzip pigz cpio rsync lz4 zstd xz-utils
+
+      - name: Checkout kernel source (${{ env.KERNEL_REPO }} @ ${{ env.KERNEL_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          fetch-depth: 1
+          path: kernel
+
+      - name: Checkout upstream patch repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PATCH_REPO }}
+          ref: ${{ env.PATCH_REF }}
+          fetch-depth: 1
+          path: upstream-patches
+
+      - name: Checkout this build repository
+        uses: actions/checkout@v4
+        with:
+          path: build-config
+
+      - name: Download AOSP prebuilt Clang
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${{ inputs.clang_ref }}/${{ inputs.clang_version }}.tar.gz"
+          echo "Downloading $URL"
+          curl -LSs "$URL" | tar xz -C "$GITHUB_WORKSPACE/clang"
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version
+
+      - name: Cache ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ env.DEVICE }}-${{ env.KERNEL_REF }}
+          max-size: 3G
+
+      - name: Configure kernel (ROM defconfig + fragments + Droidspaces options)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+
+          # 1) upstream GKI base config
+          make ${{ env.MAKE_ARGS }} gki_defconfig
+
+          # 2) the exact vendor fragments this ROM builds with
+          #    (from android_device_sony_sm8550-common/BoardConfigCommon.mk TARGET_KERNEL_CONFIG)
+          cat arch/arm64/configs/vendor/kalama_GKI.config \
+              arch/arm64/configs/vendor/sony/kalama_GKI.config \
+              arch/arm64/configs/vendor/debugfs.config \
+              >> out/.config
+
+          # 3) Droidspaces requirements
+          #
+          #    CONFIG_ANDROID_KABI_RESERVE must be enabled for the POSIX_MQUEUE
+          #    ABI-padding patch to work; it is asserted later in this job.
+          {
+            echo 'CONFIG_ANDROID_KABI_RESERVE=y'
+            echo 'CONFIG_SYSCTL=y'
+            echo 'CONFIG_NAMESPACES=y'
+            echo 'CONFIG_UTS_NS=y'
+            echo 'CONFIG_IPC_NS=y'
+            echo 'CONFIG_PID_NS=y'
+            echo 'CONFIG_USER_NS=y'
+            echo 'CONFIG_SYSVIPC=y'
+            echo 'CONFIG_SYSVIPC_SYSCTL=y'
+            echo 'CONFIG_POSIX_MQUEUE=y'
+            echo 'CONFIG_POSIX_MQUEUE_SYSCTL=y'
+            echo 'CONFIG_DEVTMPFS=y'
+            echo 'CONFIG_DEVTMPFS_MOUNT=y'
+            echo 'CONFIG_CGROUPS=y'
+            echo 'CONFIG_CGROUP_DEVICE=y'
+            echo 'CONFIG_CGROUP_PIDS=y'
+            echo 'CONFIG_MEMCG=y'
+            echo "CONFIG_LOCALVERSION=\"${{ env.LOCALVERSION }}\""
+          } >> out/.config
+
+          # 4) optional extras
+          if [ "${{ inputs.enable_extras }}" = "true" ]; then
+            {
+              echo 'CONFIG_CFS_BANDWIDTH=y'
+              echo 'CONFIG_TMPFS_XATTR=y'
+              echo 'CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y'
+              echo 'CONFIG_NETFILTER_XT_TARGET_REJECT=y'
+              echo 'CONFIG_NETFILTER_XT_TARGET_LOG=y'
+              echo 'CONFIG_NETFILTER_XT_MATCH_RECENT=y'
+              echo 'CONFIG_IP_SET=y'
+              echo 'CONFIG_IP_SET_HASH_IP=y'
+              echo 'CONFIG_IP_SET_HASH_NET=y'
+              echo 'CONFIG_NETFILTER_XT_SET=y'
+            } >> out/.config
+          fi
+
+          # 5) NTsync
+          if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
+            echo 'CONFIG_NTSYNC=y' >> out/.config
+          fi
+
+          # 6) resolve
+          make ${{ env.MAKE_ARGS }} olddefconfig
+
+          echo "----- resolved Droidspaces-relevant config -----"
+          grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|USER_NS|DEVTMPFS|NAMESPACES|UTS_NS|SYSCTL|CGROUP_DEVICE|CGROUP_PIDS|MEMCG|ANDROID_KABI_RESERVE|NTSYNC|LOCALVERSION)' out/.config || true
+
+          echo "----- required-config assertion -----"
+          MISSING=0
+          for c in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS \
+                   CONFIG_USER_NS CONFIG_DEVTMPFS CONFIG_NAMESPACES \
+                   CONFIG_ANDROID_KABI_RESERVE; do
+            if grep -q "^$c=y" out/.config; then
+              echo "  ok    $c=y"
+            else
+              echo "::error::$c is NOT enabled after olddefconfig"
+              MISSING=1
+            fi
+          done
+          if [ "${{ inputs.enable_ntsync }}" = "true" ] && ! grep -q '^CONFIG_NTSYNC=y' out/.config; then
+            echo "::error::CONFIG_NTSYNC is NOT enabled after olddefconfig"
+            MISSING=1
+          fi
+          [ "$MISSING" -eq 0 ] || exit 1
+
+      - name: Apply Droidspaces patches
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          UP="$GITHUB_WORKSPACE/upstream-patches"
+          OURS="$GITHUB_WORKSPACE/build-config/patches"
+
+          # 01 - ignore symbol CRC mismatches for loadable modules.
+          #      Enabling SYSVIPC changes sizeof(task_struct), which changes the
+          #      type CRCs of exported symbols; the vendor modules in vendor_dlkm
+          #      were built against the unpatched kernel.
+          git apply -v "$UP/OKI/5.15/01.disable_crc_checks_for_lkms.patch"
+
+          # 02 - restore cgroup file prefix handling (Droidspaces / LXC).
+          git apply -v "$UP/OKI/5.15/02.fix_restore cgroup file prefix handling .patch"
+
+          # 03 - keep struct user_struct the same size by reusing KABI padding.
+          #      The upstream file is malformed (hunk header claims 7 old lines,
+          #      body has 6), so we use a corrected copy kept in this repository.
+          git apply -v "$OURS/03-posix_mqueue_abi_padding.fixed.patch"
+
+          # 04 - move the SYSVIPC fields to the very end of task_struct so that
+          #      every other field offset is unchanged.
+          git apply -v "$UP/OKI/5.15/04.sysvipc_task_struct.patch"
+
+          # NTsync (optional)
+          if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
+            git apply -v "$UP/NTsync/ntsync_base.patch"
+            git apply -v "$UP/NTsync/ntsync_compat_android13-5.15.patch"
+          fi
+
+          # NOTE: CVE-UserNS/cve-2026-43499-rtmutex-5.15.patch is deliberately NOT
+          # applied -- this kernel tree already contains the fix (remove_waiter()
+          # uses waiter_task instead of current, with the never-enqueued guard).
+
+          echo "----- patch state -----"
+          git --no-pager diff --stat
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export PAHOLE=/usr/bin/pahole
+          ccache -M 3G
+          ccache -z
+          make ${{ env.MAKE_ARGS }} -j"$(nproc --all)" all
+          ccache -s
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          cd AnyKernel3
+          KVER="$(cat ../kernel/out/include/config/kernel.release 2>/dev/null || echo 5.15.211)"
+          ZIP="$GITHUB_WORKSPACE/AnyKernel3-${KVER}-${{ env.DEVICE }}-droidspaces.zip"
+          zip -r9 -q "$ZIP" . -x '.git/*' '.github/*' 'README.md' '*placeholder'
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          ls -lh "$ZIP"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp kernel/out/arch/arm64/boot/Image "dist/Image-${{ env.DEVICE }}-5.15.211"
+          cp kernel/out/.config "dist/resolved-config-${{ env.DEVICE }}.txt"
+          cp kernel/build.log dist/ 2>/dev/null || true
+          cp "$ZIP" dist/
+          ls -lh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidspaces-kernel-${{ env.DEVICE }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
