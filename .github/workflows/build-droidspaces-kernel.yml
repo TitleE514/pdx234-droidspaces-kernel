@@ -6,6 +6,10 @@ name: Build Droidspaces Kernel (pdx234 / Xperia 1 V)
 #
 # Adds Droidspaces support (sysvipc / posix-mqueue / IPC+user namespaces) and
 # optionally NTsync, then packages the resulting Image with AnyKernel3.
+#
+# Patch order matters: the NTsync patches ADD a "config NTSYNC" entry to
+# drivers/misc/Kconfig, so patches must be applied BEFORE the kernel config is
+# resolved or olddefconfig silently drops CONFIG_NTSYNC as an unknown symbol.
 
 on:
   workflow_dispatch:
@@ -125,6 +129,48 @@ jobs:
           key: kernel-${{ env.DEVICE }}-${{ env.KERNEL_REF }}
           max-size: 3G
 
+      # ---------------------------------------------------------------------
+      # Patches MUST come before the config step: ntsync_compat adds the
+      # "config NTSYNC" Kconfig symbol itself.
+      # ---------------------------------------------------------------------
+      - name: Apply Droidspaces patches
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          UP="$GITHUB_WORKSPACE/upstream-patches"
+          OURS="$GITHUB_WORKSPACE/build-config/patches"
+
+          # 01 - ignore symbol CRC mismatches for loadable modules.
+          #      Enabling SYSVIPC changes sizeof(task_struct), which changes the
+          #      type CRCs of exported symbols; the vendor modules in vendor_dlkm
+          #      were built against the unpatched kernel.
+          git apply -v "$UP/OKI/5.15/01.disable_crc_checks_for_lkms.patch"
+
+          # 02 - restore cgroup file prefix handling (Droidspaces / LXC).
+          git apply -v "$UP/OKI/5.15/02.fix_restore cgroup file prefix handling .patch"
+
+          # 03 - keep struct user_struct the same size by reusing KABI padding.
+          #      The upstream file is malformed (hunk header claims 7 old lines,
+          #      body has 6), so we use a corrected copy kept in this repository.
+          git apply -v "$OURS/03-posix_mqueue_abi_padding.fixed.patch"
+
+          # 04 - move the SYSVIPC fields to the very end of task_struct so that
+          #      every other field offset is unchanged.
+          git apply -v "$UP/OKI/5.15/04.sysvipc_task_struct.patch"
+
+          # NTsync (optional) - also adds "config NTSYNC" to drivers/misc/Kconfig
+          if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
+            git apply -v "$UP/NTsync/ntsync_base.patch"
+            git apply -v "$UP/NTsync/ntsync_compat_android13-5.15.patch"
+          fi
+
+          # NOTE: CVE-UserNS/cve-2026-43499-rtmutex-5.15.patch is deliberately NOT
+          # applied -- this kernel tree already contains the fix (remove_waiter()
+          # uses waiter_task instead of current, with the never-enqueued guard).
+
+          echo "----- patch state -----"
+          git --no-pager diff --stat
+
       - name: Configure kernel (ROM defconfig + fragments + Droidspaces options)
         working-directory: kernel
         run: |
@@ -211,44 +257,6 @@ jobs:
           fi
           [ "$MISSING" -eq 0 ] || exit 1
 
-      - name: Apply Droidspaces patches
-        working-directory: kernel
-        run: |
-          set -euo pipefail
-          UP="$GITHUB_WORKSPACE/upstream-patches"
-          OURS="$GITHUB_WORKSPACE/build-config/patches"
-
-          # 01 - ignore symbol CRC mismatches for loadable modules.
-          #      Enabling SYSVIPC changes sizeof(task_struct), which changes the
-          #      type CRCs of exported symbols; the vendor modules in vendor_dlkm
-          #      were built against the unpatched kernel.
-          git apply -v "$UP/OKI/5.15/01.disable_crc_checks_for_lkms.patch"
-
-          # 02 - restore cgroup file prefix handling (Droidspaces / LXC).
-          git apply -v "$UP/OKI/5.15/02.fix_restore cgroup file prefix handling .patch"
-
-          # 03 - keep struct user_struct the same size by reusing KABI padding.
-          #      The upstream file is malformed (hunk header claims 7 old lines,
-          #      body has 6), so we use a corrected copy kept in this repository.
-          git apply -v "$OURS/03-posix_mqueue_abi_padding.fixed.patch"
-
-          # 04 - move the SYSVIPC fields to the very end of task_struct so that
-          #      every other field offset is unchanged.
-          git apply -v "$UP/OKI/5.15/04.sysvipc_task_struct.patch"
-
-          # NTsync (optional)
-          if [ "${{ inputs.enable_ntsync }}" = "true" ]; then
-            git apply -v "$UP/NTsync/ntsync_base.patch"
-            git apply -v "$UP/NTsync/ntsync_compat_android13-5.15.patch"
-          fi
-
-          # NOTE: CVE-UserNS/cve-2026-43499-rtmutex-5.15.patch is deliberately NOT
-          # applied -- this kernel tree already contains the fix (remove_waiter()
-          # uses waiter_task instead of current, with the never-enqueued guard).
-
-          echo "----- patch state -----"
-          git --no-pager diff --stat
-
       - name: Build kernel
         working-directory: kernel
         run: |
@@ -257,7 +265,7 @@ jobs:
           export PAHOLE=/usr/bin/pahole
           ccache -M 3G
           ccache -z
-          make ${{ env.MAKE_ARGS }} -j"$(nproc --all)" all
+          make ${{ env.MAKE_ARGS }} -j"$(nproc --all)" all 2>&1 | tee build.log
           ccache -s
           ls -lh out/arch/arm64/boot/Image
 
