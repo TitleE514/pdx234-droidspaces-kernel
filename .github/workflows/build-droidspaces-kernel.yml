@@ -76,6 +76,27 @@ jobs:
             python3 python-is-python3 dwarves build-essential libc6-dev \
             curl git zip unzip pigz cpio rsync lz4 zstd xz-utils
 
+      # The runner has ~16 GB RAM and the cleanup step deletes the stock
+      # swapfile. The final "LTO vmlinux.o" ThinLTO link of a 5.15 kernel peaks
+      # well above that and the runner gets SIGTERM'd (exit 143) partway through.
+      # Add swap so the peak is absorbed instead of killing the job.
+      - name: Setup swap
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile /mnt/swapfile
+          if ! sudo fallocate -l 20G /swapfile; then
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=20480 status=none
+          fi
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "----- memory -----"
+          free -h
+          echo "----- disk -----"
+          df -h /
+          sudo swapon --show
+
       - name: Checkout kernel source (${{ env.KERNEL_REPO }} @ ${{ env.KERNEL_REF }})
         uses: actions/checkout@v4
         with:
