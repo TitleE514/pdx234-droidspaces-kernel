@@ -78,7 +78,24 @@ jobs:
           repository: ${{ env.KERNEL_REPO }}
           ref: ${{ env.KERNEL_REF }}
           fetch-depth: 1
+          # drivers/Kconfig sources drivers/kernelsu/Kconfig unconditionally, and
+          # drivers/kernelsu is a symlink into the KernelSU submodule. Without the
+          # submodule every `make` invocation dies with
+          #   drivers/Kconfig:239: can't open file "drivers/kernelsu/Kconfig"
+          submodules: recursive
           path: kernel
+
+      - name: Verify KernelSU submodule is present
+        run: |
+          set -euo pipefail
+          if [ ! -f kernel/KernelSU/kernel/Kconfig ]; then
+            echo "::warning::KernelSU submodule missing after checkout -- cloning it directly"
+            rm -rf kernel/KernelSU
+            git clone --depth=1 https://github.com/tyty-android/SukiSU-Ultra.git kernel/KernelSU
+          fi
+          ls -ld kernel/KernelSU kernel/drivers/kernelsu
+          test -f kernel/KernelSU/kernel/Kconfig
+          echo "KernelSU submodule OK"
 
       - name: Checkout upstream patch repository
         uses: actions/checkout@v4
